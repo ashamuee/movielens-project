@@ -1,0 +1,913 @@
+---
+title: "Report on Movilens Project"
+author: "Asham Vohra"
+date: "6/16/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+Recommendation systems have been there like forever and over time they have been incorporated by almost every business application. They are common in video steaming platforms like Netlix, Amazon Prime, restaurants' reviews and delivery applications like Yelp, Uber eats and many more. Based on application, these systems recommend a movie or a restaurant and leverage the past interaction of customer with the application or how similar users may be watching or ordering food, among others.
+
+Taking inspiration from the recommendation systems available all around us, we have attempted to build a movie recommendation system. The recommendation system leverages the publically available MovieLens dataset. 
+
+The [MovieLens dataset](https://grouplens.org/datasets/movielens/10m/) used here is hosted at GroupLens.org.  The data set is stable ensuring results are reproducible and has **10 million** ratings applied to **10,000** movies by **72,000** users. One of the components of the data set includes information about movies and its associated genres. While the other component has details of how and movies were rated by users. 
+
+The movie recommendation system developed as part of the project, looks into leveraging patterns identified across movies, users, genres and more and uses the available data set to predict movie ratings for given observation, which includes user and movie identifiers, movie title and genres.
+
+The goal of the project was to build a machine learning recommendation system which can predict movie ratings keeping RMSE(Root mean square error) minimal. 
+
+In order to achieve this goal, we took incremental approach of identifying predictors, which can predict the rating. Incrementally, we took a predictor analysed its relationship with the rating, incorporated in our model and tested our updated model against the test data. To ensure the behavior and model performance was not due to random choice of data set, the model was tuned, trained and tested against multiple partitions of the dataset. Only if the predictor helped improve our metric i.e. RMSE, the predictor under analysis and evaluation was added to the model and the steps were repeated with new predictor. Otherwise the predictor was ignored. 
+
+This report walks through the approach, analysis and evaluation carried out to achieve our movie recommendation system.
+
+# Analysis
+
+## Data Wrangling
+```{r Install and Load Packages,include=FALSE}
+# Prepare environment
+# install and load packages
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+library(tidyverse)
+library(caret)
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(knitr)
+```
+
+```{r Download File,include = FALSE, eval=FALSE}
+# Download required data sources
+# download data file
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+```
+
+```{r Extract data, include = FALSE,  eval=FALSE}
+# Prepare raw data from data sources
+# unzip and read ratings from file into columns
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+col.names = c("userId", "movieId", "rating", "timestamp"))
+
+# reads movies data file and extracts columns
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# only for code reruns
+save(ratings,file = 'rda/ratings.rda')
+save(movies,file = 'rda/movies.rda')
+```
+
+```{r only for code reruns,include=FALSE}
+load(file='rda/ratings.rda')
+load(file='rda/movies.rda')
+```
+
+A critical part for using any publically available dataset is converting it to usable form. So we carried out below steps to convert it to usable form:
+
+* started from extracting data downloaded from source,
+* the data files received had different delimiters separating various attributes of an observation. The same were handled, read and converted into a data frame.
+* Some of the attributes were not of desired data type. The concerned attributes were converted from undesired data types like strings or factors to numeric data as required. 
+
+```{r explore ratings and movies, include= FALSE}
+# Explore ratings and movies
+str(ratings)
+str(movies)
+```
+
+```{r Wrangle dataset, include = FALSE}
+# Wrangle dataset
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+title = as.character(title),
+genres = as.character(genres))
+
+str(movies)
+
+movielens <- left_join(ratings, movies, by = "movieId")
+str(movielens)
+```
+
+This is how snippet of the wrangled data looked like.
+
+```{r Glance Movie Lens Data,echo=FALSE}
+# Glance Movie Lens Data
+movielens %>% head() %>% knitr::kable()
+```
+
+## Paritioning dataset for training and validation  
+Before using the wrangled data for analysis, we partitioned the data into training and validation data sets. The idea was to keep validation data set aside and use only training data for any analysis, model development and tuning. In addition to this, we ensured that our validation set only had data for same movies and users which were present in the training data set.
+
+The data sets were named as below for furture reference:
+
+* training data set as **edx** 
+* validation data set as **validation**
+
+```{r Prepare data partition for validation and training, include=FALSE}
+# Prepare data partition for validation and training
+# if using R 3.5 or earlier, use `set.seed(1)`
+set.seed(1, sample.kind="Rounding")  
+
+# Validation set will be 10% of MovieLens data
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+str(edx)
+str(temp)
+
+# Make sure userId and movieId in validation set are also in edx set
+# Test set (temp) would be useful to have only those rows movies, users, which were in training set. So we keep only those observations and store in validation.
+validation <- temp %>% semi_join(edx, by = "movieId") %>% semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+# The removed rows from validation set can be used for training. So we add them back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+str(removed)
+
+# rm will remove the irrelevant objects
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+
+Below were the details about the elements in each of the partitioned datasets.
+```{r Basic info about training and validation dataset,  echo= FALSE}
+# The partitioned data were named edx and validation, where edx was our training data set and validation was our validation data set, which we kept aside as planned earlier. 
+
+data.frame(data_set=c("Training data set","Validation data set"),name=c('edx','validation'), count=c(nrow(edx),nrow(validation))) %>% knitr::kable()
+```
+
+For analysis, we used only the training dataset.
+
+```{r Basic Analysis, include=FALSE}
+# Let's look at how users have rated movies
+# If we look at ratings, users rated few movies
+info <- edx %>% summarise(users_count=n_distinct(userId), movies_count=n_distinct(movieId)) 
+total_ratings <- edx %>% nrow()
+
+average_movies_rated_per_user <- total_ratings/info$users_count
+
+# So average number of movies rated per user
+combine_words(c('Average number of movies rated per user',average_movies_rated_per_user),and=': ')
+```
+
+Below was the summary of number of unique movies and users in the training data set.
+```{r Basic insight, echo= FALSE}
+# Let's see number of unique movies and users in our training data set.
+info %>% knitr::kable()
+```
+
+Since total_ratings in training dataset were **`r total_ratings`**, the average number of movies rated per user were **`r round(average_movies_rated_per_user,2)`**. This means that average user rated only a subset of movies.
+
+```{r Cleanup irrelvant variables, include=FALSE}
+rm(average_movies_rated_per_user,info, total_ratings)
+```
+
+To visualise how sparse our rating dataset was, we randomly selected 50 users and 50 movies with atleast one rating made by the selected user group and plotted a graph.
+```{r Sparse Data Distribution, echo=FALSE, fig.align='center'}
+# we take 50 random users and 50 random movies and plotted the image graph
+random50userIds <- edx %>% distinct(userId) %>% slice_sample(n=50) %>% pull(userId)
+edx %>%  filter(userId %in% random50userIds) %>% select(userId,movieId,rating) %>%  mutate(rating=1) %>% spread(movieId,rating) %>% select(sample(ncol(.),50)) %>% as.matrix() %>% t(.) %>% image(1:50, 1:50,. , xlab="Movies", ylab="Users")
+abline(h=0:50+0.5, v=0:50+0.5, col = "grey")
+
+rm(random50userIds)
+```
+**Note**: Here the white space represents that for a given user, rating for a specific movie is missing and needs prediction.
+
+It it these missing ratings, our recommendation system attempted to predict once ready while maintaining minimal RMSE.
+
+So to build a recommendation system which could predict the missing ratings, we used our intuition as guidance to identify few areas to analyse and to dive into for preparing our model. The same are shared below:  
+
+* use knowledge of average rating across all movies
+* use knowledge of ratings for a movie
+* use knowledge of how movies similar to movie in question are rated 
+* use knowlege of how movies in different genres are rated
+* use knowledge of how a user rates movies,
+* use knowledge of how users similar to user under question rate a movie
+* use knowledge of year of movie release 
+
+To start building our algorithm, we further paritioned our training data set i.e. edx into five sets each having a training set and testing set. This ensured that we used only edx dataset while we developed our model. In addition, the multiple partitions helped to remove any randomness from our tuning parameters and to get an appopriate estimate of performance for our incremental model. This helped reduced the probability of overfitting.
+
+```{r Create subset of data for fine tuning and model selection, include = FALSE}
+y <- edx$rating
+set.seed(1, sample.kind = 'Rounding')
+test_indices_list <- createDataPartition(y,times=5,p=0.2,list=TRUE)
+
+rm(y)
+```
+
+Before diving into analysis and modeling carried out, it is important to understand the metric of choice i.e. RMSE
+
+*  RMSE is the root mean square error and that's what was used for this project to evaluate models and to optimize them for fitment.
+* As we know, $RMSE = sqrt( 1/N * sum((\hat{y}-y)^2) )$
+    + Here, $\hat{y}$  (to be referred as y_hat) is the prediction. In context of this project, predicted rating for movie i and user u, 
+    + and y is the actual outcome. In context of this project, actual rating for movie i and user u
+
+
+```{r Define RMSE, include=FALSE}
+# Let's define RMSE in our code
+RMSE <- function(true_ratings, predicted_ratings){
+    sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## Initial Model
+To begin with we took brute force approach i.e. all movies are rated same but their rating vary randomly only by variation explained by
+
+$y_{u,i}= true\_rating+error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, and $error_{u,i}$ is the independent error.
+
+RMSE is minimized when we minimize least square error and this was achieved by using true_rating as average of all ratings
+
+```{r Brute force model, echo=FALSE}
+mean_of_partion_list <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+
+    y_train_set <- train_set$rating
+    
+    total_mean <- mean(y_train_set)
+  }
+)
+
+total_mean <- mean(mean_of_partion_list)
+combine_words(c('Total mean',total_mean),and=': ')
+rm(mean_of_partion_list)
+```
+
+Using this as a model, the performance results were found as below:
+```{r Performance Evaluation,echo = FALSE}
+rmses <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+    test_set <- edx[test_indices,]
+    
+    x_train_set <- train_set %>% select(userId,movieId,genres)
+
+    # Before we use test_set, it needs to be filtered as it could have rows which have movies, users not present in training data.
+    # So, we use only that test data which has movieId, userId in the training data
+    test_set <- test_set %>% semi_join(x_train_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+    
+    x_test_set <- test_set %>% select(userId,movieId,genres)
+    y_test_set <- test_set$rating
+    RMSE(y_test_set,total_mean)
+  }
+)
+performance_metric <- data.frame(model_name='Brute force model',rmse=mean(rmses))
+
+performance_metric %>% knitr::kable()
+rm(rmses)
+```
+
+This was a good starting point and the RMSE value captrued here was used to analyse effectivness of any new predictor.
+
+## Movie effects
+As one may note that the brute force model depended on mean of all ratings present in the data set. However, based on the intution that the movies may be rated differently, we further explored possibility of information of movie influencing the prediction results.
+
+Below histogram depicts how mean rating of movie across movies is distributed.
+
+```{r Explore average rating per movie, echo=FALSE}
+edx %>% group_by(movieId) %>% summarise(avg=mean(rating)) %>% ggplot(aes(avg)) + geom_histogram(binwidth = 1) + xlab('Average Movie Rating') + geom_vline(xintercept=total_mean,linetype=6, color = "red",size=0.6)
+```
+**Note**: The red dotted line depicts the average rating across all movies and users.
+
+In above histogram, we noted that for lot of movies average rating was higher than the average rating across all movies and users. And for some it was lower. So our intution that different movies are rated differently was confirmed. 
+
+The variability across movies looked good enough to be analysed for inclusion in our model. Movie effect for analysis when incorporated in our model resulted to the below form:
+
+$y_{u,i}= true\_rating + b_i +error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, $b_i$ is movie effect for movie i, and $error_{u,i}$ is the independent error.
+
+As result, estimate of $b_i$ for movie i i.e $\hat{b_i} = mean(y_{u,i} - true\_rating)$
+
+Before estimating movie effects for our model, we checked how the  number of ratings per movie were distributed across movies and if it could be a concern.
+
+```{r Explain why we need regularisation, echo = FALSE}
+edx %>% dplyr::count(movieId) %>% ggplot(aes(log10(n))) + geom_histogram(binwidth=0.15) + xlab('Number of ratings per movie [log10(n) scale]')
+```
+
+The graph suggests that many movies have been rated very less number of times. This could be due to some movies being being obscure or newly released, among others. Regardless of the reason,  with such a low set of data points, there could be errors in estimating role of movie effect in the prediction of the rating i.e basically the risk of overfitting. So any movie effect needed to be penalized for less number of ratings and we used regularization to prevent our model from overfitting.
+
+```{r Split training data for lambda computation, include = FALSE}
+lambdas_per_effect <- data.frame(effect_name=character(0),lambda=numeric(0))
+
+prepare_lambda_data_set <- function(data_partition_index) {
+  test_indices <- test_indices_list[[data_partition_index]]
+  train_set <- edx[-test_indices,]
+  
+  x_train_set <- train_set %>% select(userId,movieId,genres)
+  y_train_set <- train_set$rating
+  
+  
+  set.seed(1,sample.kind='Rounding')
+  test_lambda_indices <- createDataPartition(train_set$rating,p=0.2,times=1,list=FALSE)
+  train_lambda_set <- train_set[-test_lambda_indices,]
+  test_lambda_set <- train_set[test_lambda_indices,]
+  
+  # Ensure that test_lambda_set only has movies and users present in train_lambda_set
+  test_lambda_set <- test_lambda_set %>% semi_join(train_lambda_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+  list(train=train_lambda_set,test=test_lambda_set)
+}
+```
+
+To identify regularization factor i.e. lambda($\lambda$) to use, we took a range of values and evaluated model to identify $\lambda$ which led us to the lowest RMSE. This was done across partitions of training data to ensure, the choice of $\lambda$ was not due to random nature of the dataset.
+
+With $\lambda$ our estimate of $b_i$ for movie i could be computed as below:
+
+$\hat{b_i} = sum(y_{u,i} - true\_rating)/(n + \lambda)$ 
+
+where n is the number of ratings for the given movie.
+
+```{r Compute lambda for regularization, include = FALSE}
+lambdas <- seq(0,10,0.25)
+
+lambda_to_use_per_partition <- sapply(1:5, function(index) {
+  lambda_data_set <- prepare_lambda_data_set(index)
+  train_lambda_set <- lambda_data_set[[1]]
+  test_lambda_set <- lambda_data_set[[2]]
+  
+  lambda_rmses <- sapply(lambdas, function(lambda) {
+      movie_effects <- train_lambda_set %>% group_by(movieId) %>% summarise(n=n(),b_i_hat=sum(rating - total_mean)/(n+lambda));
+      predicted_ratings <- total_mean + test_lambda_set %>% left_join(movie_effects,by='movieId') %>% pull(b_i_hat)
+
+      RMSE(test_lambda_set$rating,predicted_ratings) 
+  })
+  
+  # selecting lambda leading to lowest RMSE
+  lambda_to_use <- lambdas[which.min(lambda_rmses)]
+  paste('Lambda to use: ', lambda_to_use, ', corresponding RMSE: ', lambda_rmses[which.min(lambda_rmses)])
+
+  lambda_to_use
+})
+
+lambda_to_use_per_partition
+
+# selecting lambda 
+lambda_to_use <- mean(lambda_to_use_per_partition)
+
+lambdas_per_effect <- lambdas_per_effect %>% add_row(effect_name='movies',lambda=lambda_to_use)
+rm(lambda_to_use_per_partition, lambdas)
+```
+
+```{r Post regularization, include=FALSE}
+# computed movie effects to be used later based on all paritions
+movie_effects_list <- lapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+
+    y_train_set <- train_set$rating
+    
+    movie_effects <- train_set %>% group_by(movieId) %>% summarise(n=n(),b_i_hat=sum(rating - total_mean)/(n+lambda_to_use));
+    movie_effects
+  }
+)
+
+me <- movie_effects_list[[1]]
+for (index in 2:5) {
+   me <- me %>% full_join(movie_effects_list[[index]],by='movieId', suffix=c("1",index))
+}
+
+me <- me %>% select(-n1,-n2,-n11,-n4,-n)
+# as different partitions may not have exactly same data set combined the results
+movie_effects <- tibble(me[,1], b_i_hat=rowMeans(me[,-1],na.rm = TRUE))
+
+# to ensure we don't get random rmse due to data set. Rmse calculated based on all partitions
+rmses <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+    test_set <- edx[test_indices,]
+    
+    x_train_set <- train_set %>% select(userId,movieId,genres)
+
+    # Before we use test_set, it needs to be filtered as it could have rows which have movies, users not present in training data.
+    # So, we use only that test data which has movieId, userId in the training data
+    test_set <- test_set %>% semi_join(x_train_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+    
+    x_test_set <- test_set %>% select(userId,movieId,genres)
+    y_test_set <- test_set$rating
+    
+    movie_effects <- train_set %>% group_by(movieId) %>% summarise(n=n(),b_i_hat=sum(rating - total_mean)/(n+lambda_to_use));
+
+    predicted_ratings <- total_mean + test_set %>% left_join(movie_effects,by='movieId') %>% pull(b_i_hat)
+    RMSE(y_test_set,predicted_ratings)
+  }
+)
+```
+
+```{r Visualise how the movie effect varies, include = FALSE, eval=FALSE}
+# Let's see how the movie effect varies.
+movie_effects %>% ggplot(aes(b_i_hat)) + geom_histogram(bins=10,color=I('black'))
+```
+
+```{r Post regularization performance of the model, echo=FALSE}
+# Let's evaluate performance for this model
+# y_u_i_hat = true_rating + b_i_hat
+performance_metric <- performance_metric %>% add_row(model_name='With only movie effect model',rmse=mean(rmses))
+```
+So resulting model post regularization of the form $y_{u,i}= true\_rating + b_i +error_{u,i}$, resulted in the RMSE of `r performance_metric %>% filter(model_name=='With only movie effect model') %>% pull(rmse)`
+
+```{r Print performance metric of the model, echo=FALSE}
+performance_metric %>% knitr::kable()
+rm(index, me, movie_effects_list, rmses, lambda_to_use)
+```
+
+As we can see the evaluation metric i.e. RMSE improved considerably and therefore the movie effect was retained in our model.
+
+## User effects
+Now with model taking into account movie effect, we decided to look into other intution i.e. different users rate movies differently and to evaluate its influence on the prediction results.
+
+Below histogram depicts how average rating given by users is distributed. For this, we looked at only those users who had rated more than 100 movies.
+
+```{r Users\' rating pattern, echo=FALSE}
+edx %>% group_by(userId) %>% filter(n()>=100) %>% summarise(avg=mean(rating)) %>% ggplot(aes(avg)) + geom_histogram(bins=30,color=I('black')) + xlab('Average Rating Given By User')
+```
+In above histogram, we noted that average rating given by user varies across users and it is likely that a user who is critical or due to different preferences may rate even highly rated movies differently than other users. So our intution that different users rate movies differently was confirmed. 
+
+The variability across mean rating given by users deserved analaysis for inclusion in our model. User effect for analysis when incorporated in our model resulted to the below form:
+
+$y_{u,i}= true\_rating + b_i + b_u +error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, $b_i$ is movie effect for movie i, $b_u$ is user effect for user u, and $error_{u,i}$ is the independent error.
+
+As a result, estimate of $b_u$ for user u i.e $\hat{b_u} = mean(y_{u,i} - true\_rating - \hat{b_i})$
+
+Before estimating user effects for our model, we checked how the number of ratings per user were distributed across users and if it could be a concern.
+
+```{r Explain why we need regularisation for user effect, echo = FALSE}
+edx %>% dplyr::count(userId) %>% ggplot(aes(log10(n))) + geom_histogram(binwidth=0.15) + xlab('Number of ratings per user [log10(n) scale]')
+```
+The graph suggests that many users have rated very less number of movies. Some of the reasons for this could be that some users rate a lot, while some don't or it could be that some users were new to the movies streaming platform, among others. Regardless of the underlying reason, with such a low set of data points, there could be errors in estimating role of user effect in the prediction of the rating i.e basically the risk of overfitting. So any user effect needed to be penalized for less number of ratings made by a user and we used regularization to prevent our model from overfitting.
+
+Similar to movie effect, to identify regularization factor i.e. lambda($\lambda$) to use, we took a range of values and evaluated model to identify $\lambda$ which led us to the lowest RMSE. This was done across partitions of training data to ensure, the choice of $\lambda$ was not due to random nature of the dataset.
+
+With $\lambda$ our estimate of $b_u$ for user u could be computed as below: 
+
+$\hat{b_u} = sum(y_{u,i} - true\_rating - \hat{b_i})/(n + \lambda)$ 
+
+where n is the number of ratings for the given movie.
+
+```{r Compute lambda for regularization for user effect, include = FALSE}
+lambdas <- seq(0,10,0.25)
+
+lambda_to_use_per_partition <- sapply(1:5, function(index) {
+  lambda_data_set <- prepare_lambda_data_set(index)
+  train_lambda_set <- lambda_data_set[[1]]
+  test_lambda_set <- lambda_data_set[[2]]
+  
+  lambda_rmses <- sapply(lambdas, function(lambda) {
+      user_effects <- train_lambda_set %>% left_join(movie_effects,by='movieId') %>% group_by(userId) %>% summarise(n=n(),b_u_hat=sum(rating - total_mean - b_i_hat)/(n+lambda))
+  
+      predicted_ratings <- test_lambda_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% mutate(pred=total_mean+b_i_hat+b_u_hat) %>% pull(pred)
+  
+      RMSE(test_lambda_set$rating,predicted_ratings) 
+  })
+  
+  # selecting lambda leading to lowest RMSE
+  lambda_to_use <- lambdas[which.min(lambda_rmses)]
+  paste('Lambda to use: ', lambda_to_use, ', corresponding RMSE: ', lambda_rmses[which.min(lambda_rmses)])
+
+  lambda_to_use
+})
+
+lambda_to_use_per_partition
+
+# selecting lambda 
+lambda_to_use <- mean(lambda_to_use_per_partition)
+
+lambdas_per_effect <- lambdas_per_effect %>% add_row(effect_name='users',lambda=lambda_to_use)
+rm(lambdas,lambda_to_use_per_partition)
+```
+
+```{r Post regularization of user effect, include=FALSE}
+# So let's estimate the users'effect
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat
+
+# computed user effects to be used later based on all paritions
+user_effects_list <- lapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+
+    y_train_set <- train_set$rating
+    
+    user_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% group_by(userId) %>% summarise(n=n(),b_u_hat=sum(rating - total_mean - b_i_hat)/(n+lambda_to_use))
+
+    user_effects
+  }
+)
+
+# as different partitions may not have exactly same data set combined the results
+ue <- user_effects_list[[1]]
+for (index in 2:5) {
+   ue <- ue %>% full_join(user_effects_list[[index]],by='userId', suffix=c("1",index))
+}
+
+ue <- ue %>% select(-n1,-n2,-n11,-n4,-n)
+user_effects <- tibble(ue[,1], b_u_hat=rowMeans(ue[,-1],na.rm = TRUE))
+
+# to ensure we don't get random rmse due to data set. Rmse calculated based on all partitions
+rmses <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+    test_set <- edx[test_indices,]
+    
+    x_train_set <- train_set %>% select(userId,movieId,genres)
+
+    # Before we use test_set, it needs to be filtered as it could have rows which have movies, users not present in training data.
+    # So, we use only that test data which has movieId, userId in the training data
+    test_set <- test_set %>% semi_join(x_train_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+    
+    x_test_set <- test_set %>% select(userId,movieId,genres)
+    y_test_set <- test_set$rating
+    
+    user_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% group_by(userId) %>% summarise(n=n(),b_u_hat=sum(rating - total_mean - b_i_hat)/(n+lambda_to_use))
+
+    predicted_ratings <- test_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% mutate(pred=total_mean+b_i_hat+b_u_hat) %>% pull(pred)
+
+    RMSE(y_test_set,predicted_ratings)
+  }
+)
+```
+
+```{r Visualise how the user effect varies, include = FALSE, eval=FALSE}
+# Let's check how user effect varies across users
+user_effects %>% ggplot(aes(b_u_hat)) + geom_histogram(bins=10)
+```
+
+```{r Post regularization performance of the model updated with user effect, echo=FALSE}
+# Let's evaluate performance for this model
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat
+performance_metric <- performance_metric %>% add_row(model_name='With movie and user effect model',rmse=mean(rmses))
+```
+
+So resulting model post regularization of the form $y_{u,i}= true\_rating + b_i + b_u +error_{u,i}$, resulted in the RMSE of `r performance_metric %>% filter(model_name=='With movie and user effect model') %>% pull(rmse)`
+
+```{r Print performance metric of the model updated with user effect, echo=FALSE}
+performance_metric %>% knitr::kable()
+rm(ue, user_effects_list, index, lambda_to_use, rmses)
+```
+
+As we can see the evaluation metric i.e. RMSE improved considerably and therefore the user effect was retained in our model.
+
+## Genres effect
+Now with model already coming in shape, we decided to look into other intution i.e. movies within a genre are rated differently and evaluate its influence on the prediction results.
+
+Below errorbar plot depicts how mean rating of a genre vary across genres while at the same time capturing the confidence interval of rating for each genre.
+
+```{r Explore data, echo=FALSE}
+# Let's plot to see rating variation across genres
+# while we could have used granular genres, using genres as it is gave use more precise control over prediction
+edx %>% group_by(genres) %>%
+    summarize(n = n(), avg = mean(rating), se = sd(rating)/sqrt(n())) %>%
+    mutate(genres = reorder(genres, avg)) %>%
+    ggplot(aes(x = genres, y = avg, ymin = avg - 2*se, ymax = avg + 2*se)) + 
+    geom_point() +
+    geom_errorbar() + 
+    theme(axis.text.x =  element_blank()) + 
+    xlab("Genres") + 
+    ylab('Average rating of all movies for a given genre')
+```
+In above plot, we noted that geners are rated differently contributing to variability in average rating of genres. One likely reason is that users rate movies belonging to one genres differently than movies belonging to other genres due to their preference. So our intution that movies in different genres are rated differently was confirmed. 
+
+The variability of mean rating across genres could influence our final prediction and as a result the genres effect was considered for further analaysis for inclusion in the model. Genre effect for analysis when incorporated in the current model resulted to the below form:
+
+$y_{u,i}= true\_rating + b_i + b_u + b_g +error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, $b_i$ is movie effect for movie i, $b_u$ is user effect for user u, $b_g$ is the genre effect for genre g and $error_{u,i}$ is the independent error.
+
+As a result, estimate of $b_g$ for each genre i.e $\hat{b_g} = mean(y_{u,i} - true\_rating - \hat{b_i} - \hat{b_u})$
+
+Before estimating genres effects for our model, we checked how the number of ratings per genres were distributed across genres and if it could be a concern.
+
+```{r Explain why we need regularisation of genre effect, echo=FALSE}
+edx %>% dplyr::count(genres) %>% ggplot(aes(log10(n))) + geom_histogram(binwidth=0.15) + xlab('Number of ratings across movies per genre [log10(n) scale]')
+```
+The graph suggests that many genres have very less number of ratings as the movies belonging to the genres were rated insufficient number of times. And with such a low set of data points, there could be errors in estimating role of genres effect to the prediction of the rating i.e basically the risk of overfitting. So any genres effect needed to be penalized for less number of ratings and we used regularization to prevent our model from overfitting.
+
+Similar to other effects discussed, to identify regularization factor i.e. lambda($\lambda$) to use, we took a range of values and evaluated model to identify $\lambda$ which led us to the lowest RMSE.
+
+With $\lambda$ our estimate of $b_g$ for each genre could be computed as below:
+
+$\hat{b_g} = sum(y_{u,i} - true\_rating - \hat{b_i} - \hat{b_u})/(n + \lambda)$ 
+
+where n is the number of ratings across movies associated with the given genre
+
+```{r Compute lambda for regularization of genre effect, include=FALSE}
+lambdas <- seq(0,10,1)
+
+lambda_to_use_per_partition <- sapply(1:5, function(index) {
+  lambda_data_set <- prepare_lambda_data_set(index)
+  train_lambda_set <- lambda_data_set[[1]]
+  test_lambda_set <- lambda_data_set[[2]]
+  
+  lambda_rmses <- sapply(lambdas, function(lambda) {
+      genre_effects <- train_lambda_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% group_by(genres) %>% summarise(n=n(),b_g_hat=sum(rating - total_mean-b_i_hat-b_u_hat)/(n+lambda))
+  
+      predicted_ratings <- test_lambda_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% mutate(pred=total_mean+b_i_hat+b_u_hat+b_g_hat) %>% pull(pred)
+  
+      RMSE(test_lambda_set$rating,predicted_ratings) 
+  })
+  
+  # selecting lambda leading to lowest RMSE
+  lambda_to_use <- lambdas[which.min(lambda_rmses)]
+  paste('Lambda to use: ', lambda_to_use, ', corresponding RMSE: ', lambda_rmses[which.min(lambda_rmses)])
+
+  lambda_to_use
+})
+
+lambda_to_use_per_partition
+
+# selecting lambda 
+lambda_to_use <- mean(lambda_to_use_per_partition)
+
+lambdas_per_effect <- lambdas_per_effect %>% add_row(effect_name='genres',lambda=lambda_to_use)
+rm(lambdas,lambda_to_use_per_partition)
+```
+
+```{r Post regularization of genre effect, include=FALSE}
+# So let's estimate the genre'effect
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat + b_g_hat
+
+# computed genres effects to be used later based on all paritions
+genres_effects_list <- lapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+
+    y_train_set <- train_set$rating
+    
+    genre_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% group_by(genres) %>% summarise(n=n(),b_g_hat=sum(rating - total_mean-b_i_hat-b_u_hat)/(n+lambda_to_use))
+
+    genre_effects
+  }
+)
+
+# as different partitions may not have exactly same data set combined the results
+ge <- genres_effects_list[[1]]
+for (index in 2:5) {
+   ge <- ge %>% full_join(genres_effects_list[[index]],by='genres', suffix=c("1",index))
+}
+
+ge <- ge %>% select(-n1,-n2,-n11,-n4,-n)
+genre_effects <- tibble(ge[,1], b_g_hat=rowMeans(ge[,-1],na.rm = TRUE))
+
+# to ensure we don't get random rmse due to data set. Rmse calculated based on all partitions
+rmses <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+    test_set <- edx[test_indices,]
+    
+    x_train_set <- train_set %>% select(userId,movieId,genres)
+
+    # Before we use test_set, it needs to be filtered as it could have rows which have movies, users not present in training data.
+    # So, we use only that test data which has movieId, userId in the training data
+    test_set <- test_set %>% semi_join(x_train_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+    
+    x_test_set <- test_set %>% select(userId,movieId,genres)
+    y_test_set <- test_set$rating
+    
+    genre_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% group_by(genres) %>% summarise(n=n(),b_g_hat=sum(rating - total_mean-b_i_hat-b_u_hat)/(n+lambda_to_use))
+
+    predicted_ratings <- test_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% mutate(pred=total_mean+b_i_hat+b_u_hat+b_g_hat) %>% pull(pred)
+
+    RMSE(y_test_set,predicted_ratings)
+  }
+)
+```
+
+```{r Visualise how the genre effect varies, include = FALSE, eval=FALSE}
+# Let's see how the genre effect varies.
+genre_effects %>% ggplot(aes(b_g_hat)) + geom_histogram(bins = 100,color=I('black')) + scale_y_sqrt() + ylab('count [sqrt scale]')
+```
+
+```{r Post regularization performance of the model updated with genres effect, echo=FALSE}
+# Let's evaluate performance for this model
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat + b_g_hat
+performance_metric <- performance_metric %>% add_row(model_name='With movie, user and genre effect model',rmse=mean(rmses))
+```
+
+So resulting model post regularization of the form $y_{u,i}= true\_rating + b_i + b_u + b_g +error_{u,i}$, resulted in the RMSE of `r performance_metric %>% filter(model_name=='With movie, user and genre effect model') %>% pull(rmse)`
+
+```{r Print performance metric of the model updated with genres effect, echo=FALSE}
+performance_metric %>% knitr::kable()
+rm(ge,genres_effects_list,index,lambda_to_use,rmses)
+```
+
+As we can see the evaluation metric i.e. RMSE improved and therefore the genre effect was retained in our model.
+
+## Year of release effect
+Now with model already coming in shape, we decided to look into other intution i.e. year of release of movie influences the rating of the movie and to evaluate its influence on the prediction results.
+
+For this, we extracted the year of release of movie from the movie title attribute available in the dataset and later we used this information to compute mean rating of all movies released in that year.
+
+```{r Extracting year of release, include = FALSE}
+# extracting year of release
+load(file='rda/movies.rda')
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+                                           
+release_year <- sapply(movies$title,function(title){ str_match_all(title,'\\((\\d\\d\\d\\d)\\)')[[1]][1,2]})
+
+release_year_per_movie <- movies %>% mutate(year_of_release=as.numeric(release_year)) %>% select(movieId,year_of_release)
+
+# Example of extracted attribute
+release_year_per_movie %>% head() %>% knitr::kable()
+```
+
+Below errorbar plot depicts how mean rating of movies released in a year varies as year of release increases. while at the same time capturing the confidence interval of rating for each year of release
+
+```{r Visualizing Avg ratings of movies released in an year vs year of release, echo = FALSE}
+edx %>% left_join(release_year_per_movie,by='movieId') %>% group_by(year_of_release) %>%
+    summarize(n = n(), avg = mean(rating), se = sd(rating)/sqrt(n())) %>%
+    ggplot(aes(x = year_of_release, y = avg, ymin = avg - 2*se, ymax = avg + 2*se)) + 
+    geom_point() +
+    geom_errorbar() + 
+    theme(axis.text.x = element_text(angle=90)) + 
+    xlab("Year of Release") + 
+    ylab('Average rating of all movies released in the year')
+```
+In above plot, one can see that recently released movies tend to have less mean rating than earlier released movies. This confirmed our intuition that year of release of movie influenced the rating of a movie.
+
+The variability of mean rating across years of release could influence our final prediction and as a result the year of release effect was considered for further analysis for inclusion in the model. Year or release effect for analysis when incorporated in the current model resulted to the below form:
+
+$y_{u,i}= true\_rating + b_i + b_u + b_g + b_y + error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, $b_i$ is movie effect for movie i, $b_u$ is user effect for user u, $b_g$ is the genre effect for genre g and $b_y$ is the year of release effect for year y and $error_{u,i}$ is the independent error.
+
+As a result, estimate of $b_y$ for each year of release i.e $\hat{b_y} = mean(y_{u,i} - true\_rating - \hat{b_i} - \hat{b_u} - \hat{b_g})$
+
+Before estimating year of release effects for our model, we checked how the number of ratings per year of release were distributed across years and if it could be a concern.
+
+```{r Explain why we need regularisation for year of release effect, echo=FALSE}
+edx %>% left_join(release_year_per_movie,by='movieId') %>% dplyr::count(year_of_release) %>% ggplot(aes(log10(n))) + geom_histogram(binwidth=0.15) + xlab('Number of ratings per year of release [log10(n) scale]')
+```
+The graph suggests that many years of release have very less number of ratings as the movies were rated very less number of times. Few reasons for this could be ratings for older movies were not captured or the recently released movies may have less number of ratings or number of movies released in year were few. Regardless of the underlying reason, with such a low set of data points, there could be errors in estimating role of years of release effect to the prediction of the rating i.e basically the risk of overfitting. So any years of release effect needed to be penalized for less number of ratings and we used regularization to prevent our model from overfitting.
+
+Similar to other effects discussed, to identify regularization factor i.e. lambda($\lambda$) to use, we took a range of values and evaluated model to identify $\lambda$ which led us to the lowest RMSE.
+
+With $\lambda$ our estimate of $b_y$ for each year of release can be computed as below:
+
+$\hat{b_y} = sum(y_{u,i} - true\_rating - \hat{b_i} - \hat{b_u} - \hat{b_g})/(n + \lambda)$ 
+
+where n is the number of ratings across all movies for the given year of release
+
+```{r Compute lambda for regularization for year of release effect, include=FALSE}
+lambdas <- seq(0,10,1)
+
+lambda_to_use_per_partition <- sapply(1:5, function(index) {
+  lambda_data_set <- prepare_lambda_data_set(index)
+  train_lambda_set <- lambda_data_set[[1]]
+  test_lambda_set <- lambda_data_set[[2]]
+  
+  lambda_rmses <- sapply(lambdas, function(lambda) {
+      release_year_effects <- train_lambda_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_per_movie,by='movieId') %>% group_by(year_of_release) %>%  summarise(n=n(),b_y_hat=sum(rating - total_mean-b_i_hat-b_u_hat-b_g_hat)/(n+lambda))
+  
+      predicted_ratings <- test_lambda_set %>% left_join(release_year_per_movie,by='movieId') %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_effects,by='year_of_release') %>% mutate(pred=total_mean+b_i_hat+b_u_hat+b_g_hat+b_y_hat) %>% pull(pred)
+  
+      RMSE(test_lambda_set$rating,predicted_ratings) 
+  })
+  
+  # selecting lambda leading to lowest RMSE
+  lambda_to_use <- lambdas[which.min(lambda_rmses)]
+  paste('Lambda to use: ', lambda_to_use, ', corresponding RMSE: ', lambda_rmses[which.min(lambda_rmses)])
+
+  lambda_to_use
+})
+
+lambda_to_use_per_partition
+
+# selecting lambda 
+lambda_to_use <- mean(lambda_to_use_per_partition)
+lambdas_per_effect <- lambdas_per_effect %>% add_row(effect_name='year_of_release',lambda=lambda_to_use)
+
+rm(lambdas,lambda_to_use_per_partition)
+```
+
+```{r Post regularization for year of release effect, include= FALSE}
+# So let's estimate the release year effect
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat + b_g_hat + b_y_hat
+
+# computed release year effect to be used later based on all paritions
+release_year_effects_list <- lapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+
+    y_train_set <- train_set$rating
+    
+    release_year_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_per_movie,by='movieId') %>% group_by(year_of_release) %>%  summarise(n=n(),b_y_hat=sum(rating - total_mean-b_i_hat-b_u_hat-b_g_hat)/(n+lambda_to_use))
+
+
+    release_year_effects
+  }
+)
+
+# as different partitions may not have exactly same data set combined the results
+rye <- release_year_effects_list[[1]]
+for (index in 2:5) {
+   rye <- rye %>% full_join(release_year_effects_list[[index]],by='year_of_release', suffix=c("1",index))
+}
+
+rye <- rye %>% select(-n1,-n2,-n11,-n4,-n)
+release_year_effects <- tibble(rye[,1], b_y_hat=rowMeans(rye[,-1],na.rm = TRUE))
+
+# to ensure we don't get random rmse due to data set. Rmse calculated based on all partitions
+rmses <- sapply(1:5, function(index) {
+    test_indices <- test_indices_list[[index]]
+    train_set <- edx[-test_indices,]
+    test_set <- edx[test_indices,]
+    
+    x_train_set <- train_set %>% select(userId,movieId,genres)
+
+    # Before we use test_set, it needs to be filtered as it could have rows which have movies, users not present in training data.
+    # So, we use only that test data which has movieId, userId in the training data
+    test_set <- test_set %>% semi_join(x_train_set,by="movieId") %>% semi_join(x_train_set,by="userId")
+    
+    x_test_set <- test_set %>% select(userId,movieId,genres)
+    y_test_set <- test_set$rating
+    
+    release_year_effects <- train_set %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_per_movie,by='movieId') %>% group_by(year_of_release) %>%  summarise(n=n(),b_y_hat=sum(rating - total_mean-b_i_hat-b_u_hat-b_g_hat)/(n+lambda_to_use))
+
+
+    predicted_ratings <- test_set %>% left_join(release_year_per_movie,by='movieId') %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_effects,by='year_of_release') %>% mutate(pred=total_mean+b_i_hat+b_u_hat+b_g_hat+b_y_hat) %>% pull(pred)
+
+    RMSE(y_test_set,predicted_ratings)
+  }
+)
+```
+
+```{r Visualise how the release year effect varies, include = FALSE, eval=FALSE}
+# Let's see how the release year effect varies
+release_year_effects %>% ggplot(aes(b_y_hat)) + geom_histogram(bins = 100,color=I('black'))
+```
+
+```{r Post regularization performance of the model updated with release year effect, echo=FALSE}
+# Let's evaluate performance for this model
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat + b_g_hat + b_y_hat
+performance_metric <- performance_metric %>% add_row(model_name='With movie, user, genre and release year effect model',rmse=mean(rmses))
+```
+
+So resulting model post regularization of the form $y_{u,i}= true\_rating + b_i + b_u + b_g + b_y +error_{u,i}$, resulted in the RMSE of `r performance_metric %>% filter(model_name=='With movie, user, genre and release year effect model') %>% pull(rmse)`
+
+```{r Print performance metric of the model updated with release year effect, echo=FALSE}
+performance_metric %>% knitr::kable()
+rm(index, lambda_to_use, release_year, rmses, movies,rye,release_year_effects_list)
+```
+
+As we can see the evaluation metric i.e. RMSE improved and therefore the year of release effect was retained in our model.
+
+# Results
+Post evaluation with multiple predictors, the final model resulted to the below form:
+
+$y_{u,i}= true\_rating + b_i + b_u + b_g + b_y + error_{u,i}$
+
+where $y_{u,i}$ is the rating of movie i for user u, true_rating is the true rating across users and movies, $b_i$ is movie effect for movie i, $b_u$ is user effect for user u, $b_g$ is the genre effect for genre g and $b_y$ is the year of release effect for year y and $error_{u,i}$ is the independent error.
+
+Till this point, we had used only training data set i.e. edx to develop the model and tune it. However, since the model was now identified and regularized, we trained the final model over the entire training data set i.e. edx and then tested it against the validation data set i.e. validation.
+```{r Training model, include=FALSE}
+# Training model
+set.seed(1, sample.kind = 'Rounding')
+
+lambda_to_use <- lambdas_per_effect %>% filter(effect_name=='movies') %>% pull(lambda)
+movie_effects <- edx %>% group_by(movieId) %>% summarise(n=n(),b_i_hat=sum(rating - total_mean)/(n+lambda_to_use));
+
+lambda_to_use <- lambdas_per_effect %>% filter(effect_name=='users') %>% pull(lambda)
+user_effects <- edx %>% left_join(movie_effects,by='movieId') %>% group_by(userId) %>% summarise(n=n(),b_u_hat=sum(rating - total_mean - b_i_hat)/(n+lambda_to_use))
+
+lambda_to_use <- lambdas_per_effect %>% filter(effect_name=='genres') %>% pull(lambda)
+genre_effects <- edx %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% group_by(genres) %>% summarise(n=n(),b_g_hat=sum(rating - total_mean-b_i_hat-b_u_hat)/(n+lambda_to_use))
+
+lambda_to_use <- lambdas_per_effect %>% filter(effect_name=='year_of_release') %>% pull(lambda)
+release_year_effects <- edx %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_per_movie,by='movieId') %>% group_by(year_of_release) %>%  summarise(n=n(),b_y_hat=sum(rating - total_mean-b_i_hat-b_u_hat-b_g_hat)/(n+lambda_to_use))
+```
+
+Below is the summary of each incremental model and our final model against the performance metric i.e. RMSE
+```{r Validating model, echo = FALSE}
+# predictons 
+predicted_ratings <- validation %>% left_join(release_year_per_movie,by='movieId') %>% left_join(movie_effects,by='movieId') %>% left_join(user_effects,by='userId') %>% left_join(genre_effects,by='genres') %>% left_join(release_year_effects,by='year_of_release') %>% mutate(pred=total_mean+b_i_hat+b_u_hat+b_g_hat+b_y_hat) %>% pull(pred)
+
+# Let's evaluate performance for this model
+# y_u_i_hat = true_rating + b_i_hat + b_u_hat + b_g_hat + b_y_hat
+performance_metric <- performance_metric %>% add_row(model_name='Final model',rmse=RMSE(validation$rating,predicted_ratings))
+
+performance_metric %>% knitr::kable()
+```
+
+For the **final model**, the performance metric i.e. RMSE = **`r performance_metric %>% filter(model_name=='Final model') %>% pull(rmse)`** captured against **validation** dataset was inline with the training data set and it was within desired range for model to be useful for predicting rating of a movie for a given user.
+
+# Conclusion
+As part of this project, the goal was to build a movie recommendation system which could predict the rating for a movie and a user with minimal RMSE. 
+
+During the course of project, we evaluated various predictors backed by intution and data, and applied multiple techniques to reach to a model which performs within desired range of RMSE and can be useful for predicting rating of a movie for a given user. Due care was taken to prevent overfitting from influencing our model.
+
+While we did take this approach given the hardware constraints, however, given more resources we could explore standardised supervised learning algorithms like k nearest neighbours or random forests among others or build incremental learning on top of the model as the recommendation systems will have to deal with new users and new movie releases and eventually learn from them and predict for those cases.
+
+Having said that the movie recommendation system built as part of the project is performant and can be leveraged to develop further.
